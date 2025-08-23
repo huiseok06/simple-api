@@ -7,6 +7,11 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import ytdl from 'ytdl-core';
 
+const YTDL_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9,ko;q=0.8'
+};
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -127,20 +132,15 @@ app.post('/jobs', async (req,res)=>{
         const ttsMp3 = path.join(dir,'tts.mp3');
 
         // 1) info+다운로드 (itag 18 = mp4(360p)+오디오 포함)
-        const info = await ytdl.getInfo(youtubeUrl);
+        const info = await ytdl.getInfo(youtubeUrl, { requestOptions: { headers: YTDL_HEADERS } });
         const f18 = ytdl.chooseFormat(info.formats, { quality: '18' });
-        const format = (f18 && f18.hasAudio && f18.hasVideo) ? f18 : ytdl.chooseFormat(info.formats, { quality: 'lowest' });
-
-        const title = info?.videoDetails?.title || '제목';
-        const durationSec = Number(info?.videoDetails?.lengthSeconds || 10);
-
+        const format = (f18 && f18.hasAudio && f18.hasVideo) ? f18 : ytdl.chooseFormat(info.formats, { quality: 'lowest', filter: 'audioandvideo' });
         await new Promise((resolve, reject)=>{
-          ytdl.downloadFromInfo(info, { format })
-            .pipe(fs.createWriteStream(mp4))
+          ytdl.downloadFromInfo(info, { format, requestOptions: { headers: YTDL_HEADERS } })
+            .pipe(fs.createWriteStream(out))
             .on('finish', resolve)
             .on('error', reject);
         });
-        await writeJob(id, { status:'analyzing', progress:50, files:{ videoPath: mp4 } });
 
         // 2) "제목 한 줄" 타임라인 (0초→min(6초, 전체길이))
         const line = { id: sha256(title).slice(0,8), start: 0, end: Math.min(6, durationSec), text: title };
