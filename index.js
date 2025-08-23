@@ -1,12 +1,14 @@
-// C:\simple-api\index.js
+// index.js — Title API + Minimal YouTube Download Jobs (ESM)
+// ---------------------------------------------------------
+// 필요 패키지: express, cors, fs-extra, ytdl-core (package.json에 포함)
+// Node 18+ (전역 fetch 사용). Render 환경변수: NODE_VERSION=18 권장.
+
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs-extra';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import ytdl from 'ytdl-core';
-import { YoutubeTranscript } from 'youtube-transcript';
-import { spawn } from 'node:child_process';
 
 const app = express();
 app.use(cors());
@@ -15,276 +17,111 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.resolve('data');
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
-const { AZURE_SPEECH_KEY, AZURE_SPEECH_REGION } = process.env;
 
-// 정적 파일 서빙 (브라우저에서 /files/... 로 접근)
+// 정적 파일: /files/... 로 공개
 app.use('/files', express.static(DATA_DIR));
-app.get('/health', (req,res)=> res.json({ ok:true, time:Date.now() }));
 
-// ───────────────── 유틸 ─────────────────
+// -------- 유틸 --------
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const ensureDir = async (p) => fs.ensureDir(p);
 const jobDir = (id) => path.join(DATA_DIR, 'jobs', id);
 const toUrl = (abs) => `${PUBLIC_BASE_URL}/files/${path.relative(DATA_DIR, abs).replace(/\\/g,'/')}`;
-const escapeXml = (t='') => String(t)
-  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-  .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 
-// ───────────────── FFmpeg 경로 (핵심) ─────────────────
-const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
-function runFfmpeg(args, cwd){
-  return new Promise((resolve, reject)=>{
-    const p = spawn(FFMPEG, args, { cwd });
-    let out='';
-    p.stdout.on('data', d=> out+=d.toString());
-    p.stderr.on('data', d=> out+=d.toString());
-    p.on('close', code=> code===0 ? resolve(out) : reject(new Error('ffmpeg failed\n'+out)));
-  });
-}
-// 버전 확인용(테스트 편의)
-app.get('/ffmpeg', async (req,res)=>{
-  try{
-    const out = await runFfmpeg(['-version']);
-    res.json({ ok:true, version: out.split('\n')[0] });
-  }catch(e){ res.status(500).json({ ok:false, error: String(e?.message||e) }); }
-});
-
-// ───────────────── Azure TTS ─────────────────
-async function azureVoices(){
-  const url = `https://${AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/voices/list`;
-  const r = await fetch(url, { headers: { 'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY } });
-  if(!r.ok) throw new Error(`voices http ${r.status}`);
-  return r.json();
-}
-function pickVoiceShortName(list, voiceId='ko/female_basic'){
-  const ko = list.filter(v=> v.Locale==='ko-KR');
-  const fallback = ko.find(v=>/SunHi|EunBi|JiMin|Ara/i.test(v.ShortName))?.ShortName || 'ko-KR-SunHiNeural';
-  const map = {
-    'ko/male_basic': ko.find(v=>/InJoon|Hyunsu|Joon|Sang/i.test(v.ShortName))?.ShortName || 'ko-KR-InJoonNeural',
-    'ko/female_basic': fallback,
-  };
-  return map[voiceId] || fallback;
-}
-async function azureSynthesizeSSML(ssml){
-  const url = `https://${AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`;
-  const r = await fetch(url, {
-    method:'POST',
-    headers:{
-      'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
-      'Content-Type':'application/ssml+xml',
-      'X-Microsoft-OutputFormat':'audio-24khz-48kbitrate-mono-mp3',
-      'User-Agent':'ai-sports-tts'
-    },
-    body:ssml
-  });
-  if(!r.ok){ const detail=await r.text(); throw new Error(`azure tts failed: ${detail}`); }
-  return Buffer.from(await r.arrayBuffer());
-}
-function buildStitchedSSML(lines, shortName, {style='general', pitch=0, rate=100}={}){
-  let parts = [];
-  for(let i=0;i<lines.length;i++){
-    const L = lines[i];
-    parts.push(`<s>${escapeXml(L.text)}</s>`);
-    const next = lines[i+1];
-    if(next){
-      const gapMs = Math.max(0, Math.round((next.start - L.end)*1000));
-      if(gapMs>80) parts.push(`<break time="${gapMs}ms"/>`);
-    }
-  }
-  return `<?xml version="1.0" encoding="utf-8"?>\n`+
-    `<speak version="1.0" xml:lang="ko-KR" xmlns:mstts="https://www.w3.org/2001/mstts">`+
-    `<voice name="${shortName}">`+
-    `<mstts:express-as style="${style}" styledegree="1">`+
-    `<prosody pitch="${pitch}st" rate="${rate}%">${parts.join(' ')}</prosody>`+
-    `</mstts:express-as>`+
-    `</voice>`+
-    `</speak>`;
-}
-
-// ───────────────── 다운로드 & 자막 ─────────────────
-function getYouTubeId(u){
-  try{
-    const m1 = u.match(/[?&]v=([^&]+)/); if(m1) return m1[1];
-    const m2 = u.match(/youtu\.be\/([^?]+)/); if(m2) return m2[1];
-    const m3 = u.match(/youtube\.com\/shorts\/([^?]+)/); if(m3) return m3[1];
-    const m4 = u.match(/embed\/([^?]+)/); if(m4) return m4[1];
-  }catch{}
-  return '';
-}
-async function downloadProgressiveMp4(youtubeUrl, outPath){
-  const info = await ytdl.getInfo(youtubeUrl);
-  const f18 = ytdl.chooseFormat(info.formats, { quality: '18' });
-  const format = (f18 && f18.hasAudio && f18.hasVideo) ? f18 : ytdl.chooseFormat(info.formats, { quality: 'lowest' });
-  await new Promise((resolve, reject)=>{
-    ytdl.downloadFromInfo(info, { format })
-      .pipe(fs.createWriteStream(outPath))
-      .on('finish', resolve)
-      .on('error', reject);
-  });
-}
-async function fetchAutoTranscript(videoId){
-  let items = [];
-  try{ items = await YoutubeTranscript.fetchTranscript(videoId, {lang:'ko'}); }catch{}
-  if(!items?.length){ try{ items = await YoutubeTranscript.fetchTranscript(videoId, {lang:'en'}); }catch{} }
-  if(!items?.length){ items = await YoutubeTranscript.fetchTranscript(videoId).catch(()=>[]); }
-  let t=0; const lines=[];
-  for(const it of items){
-    const start = (it.offset || t)/1000;
-    const end = start + (it.duration||0)/1000;
-    lines.push({ id: sha256(start+it.text).slice(0,8), start, end, text: it.text });
-    t = (it.offset||t) + (it.duration||0);
-  }
-  return lines;
-}
-
-// ───────────────── 파일 기반 잡 저장 ─────────────────
 async function writeJob(id, patch){
   const dir = jobDir(id); await ensureDir(dir);
   const p = path.join(dir, 'job.json');
-  let cur={ id, status:'queued', progress:0, createdAt:Date.now(), files:{} };
+  let cur = { id, status:'queued', progress:0, createdAt:Date.now(), files:{} };
   if(await fs.pathExists(p)) cur = JSON.parse(await fs.readFile(p,'utf8'));
   const next = { ...cur, ...patch, updatedAt:Date.now() };
   await fs.writeFile(p, JSON.stringify(next,null,2));
   return next;
 }
 async function readJob(id){
-  const p = path.join(jobDir(id), 'job.json');
+  const p = path.join(jobDir(id),'job.json');
   if(!(await fs.pathExists(p))) return null;
   return JSON.parse(await fs.readFile(p,'utf8'));
 }
 
-// ───────────────── 라우트 ─────────────────
-app.get('/voices', async (req,res)=>{
-  try{ const list = await azureVoices();
-    const ko = list.filter(v=>v.Locale==='ko-KR');
-    const male = ko.find(v=>/InJoon|Hyunsu|Joon|Sang/i.test(v.ShortName))?.ShortName || 'ko-KR-InJoonNeural';
-    const female = ko.find(v=>/SunHi|EunBi|JiMin|Ara/i.test(v.ShortName))?.ShortName || 'ko-KR-SunHiNeural';
-    res.json([
-      { id:'ko/male_basic', label:'남성(기본)', tier:'free', vendor:'azure', shortName: male },
-      { id:'ko/female_basic', label:'여성(기본)', tier:'free', vendor:'azure', shortName: female },
-    ]);
-  }catch(e){ console.error(e); res.status(500).json({error:'voices failed'}); }
-});
+// -------- 헬스 --------
+app.get('/health', (req,res)=> res.json({ ok:true, time:Date.now() }));
 
-// 1) 잡 생성
-app.post('/jobs', async (req,res)=>{
-  const { youtubeUrl, voiceId='ko/female_basic' } = req.body || {};
-  if(!youtubeUrl || !ytdl.validateURL(youtubeUrl)) return res.status(400).json({error:'invalid youtubeUrl'});
-  const id = sha256(youtubeUrl).slice(0,12)+'-'+Date.now().toString(36);
-  await writeJob(id, { status:'downloading', progress:5, voiceId });
-  res.json({ jobId:id, status:'downloading' });
-
-  (async()=>{
+// -------- /title: 유튜브 제목 가져오기 --------
+// 우선 ytdl-core → 실패 시 oEmbed → noembed 폴백
+app.post('/title', async (req,res)=>{
+  const { youtubeUrl } = req.body || {};
+  try{
+    if(!youtubeUrl || !ytdl.validateURL(youtubeUrl)){
+      return res.status(400).json({ error: 'invalid youtubeUrl' });
+    }
+    let title = '';
+    let firstErr;
+    // 1) ytdl-core
     try{
-      const dir = jobDir(id); await ensureDir(dir);
-      const mp4 = path.join(dir,'video.mp4');
-      const linesJson = path.join(dir,'lines.json');
-      const ttsMp3 = path.join(dir,'tts.mp3');
-
-      await downloadProgressiveMp4(youtubeUrl, mp4);
-      await writeJob(id, { status:'analyzing', progress:40, files:{ videoPath: mp4 } });
-
-      const vid = getYouTubeId(youtubeUrl);
-      const lines = await fetchAutoTranscript(vid);
-      await fs.writeFile(linesJson, JSON.stringify(lines,null,2));
-      await writeJob(id, { status:'tts', progress:60, files:{ videoPath: mp4, linesPath: linesJson, editableLinesPath: linesJson } });
-
-      const voices = await azureVoices();
-      const shortName = pickVoiceShortName(voices, voiceId);
-      const ssml = buildStitchedSSML(lines, shortName, {style:'general', pitch:0, rate:100});
-      const buf = await azureSynthesizeSSML(ssml);
-      await fs.writeFile(ttsMp3, buf);
-
-      await writeJob(id, { status:'done', progress:100, files:{ videoPath: mp4, editableLinesPath: linesJson, ttsPath: ttsMp3 } });
-    }catch(e){ console.error('job failed', e); await writeJob(id, { status:'failed', progress:100, error: String(e?.message||e) }); }
-  })();
+      const info = await ytdl.getInfo(youtubeUrl);
+      title = info?.videoDetails?.title || '';
+    }catch(e){ firstErr = e; console.error('[ytdl-core] failed:', e?.message || e); }
+    // 2) YouTube oEmbed
+    if(!title){
+      const url = 'https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent(youtubeUrl);
+      const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if(r.ok){ const j = await r.json(); title = j?.title || ''; }
+      else { console.error('[oEmbed] HTTP', r.status); }
+    }
+    // 3) noembed
+    if(!title){
+      const url = 'https://noembed.com/embed?url=' + encodeURIComponent(youtubeUrl);
+      const r = await fetch(url);
+      if(r.ok){ const j = await r.json(); title = j?.title || ''; }
+      else { console.error('[noembed] HTTP', r.status); }
+    }
+    if(!title){ return res.status(500).json({ error:'failed to fetch title', reason: firstErr?.message || 'unknown' }); }
+    return res.json({ title });
+  }catch(e){ console.error('title route fatal:', e); return res.status(500).json({ error:'failed to fetch title' }); }
 });
 
-// 2) 잡 조회
+// -------- /jobs: 최소한의 다운로드 잡(영상만 다운로드) --------
+// 입력: { youtubeUrl } → 응답: { jobId }
+// 백그라운드로 itag 18(360p, 오디오 포함) MP4를 저장
+app.post('/jobs', async (req,res)=>{
+  const { youtubeUrl } = req.body || {};
+  try{
+    if(!youtubeUrl || !ytdl.validateURL(youtubeUrl)){
+      return res.status(400).json({ error:'invalid youtubeUrl' });
+    }
+    const id = sha256(youtubeUrl).slice(0,12) + '-' + Date.now().toString(36);
+    await writeJob(id, { status:'downloading', progress:10, src: youtubeUrl });
+    res.json({ jobId: id, status: 'downloading' });
+
+    // 비동기 다운로드
+    (async()=>{
+      try{
+        const dir = jobDir(id); await ensureDir(dir);
+        const out = path.join(dir, 'video.mp4');
+        const info = await ytdl.getInfo(youtubeUrl);
+        // progressive MP4(오디오 포함) 우선
+        const f18 = ytdl.chooseFormat(info.formats, { quality: '18' });
+        const format = (f18 && f18.hasAudio && f18.hasVideo) ? f18 : ytdl.chooseFormat(info.formats, { quality: 'lowest' });
+        await new Promise((resolve, reject)=>{
+          ytdl.downloadFromInfo(info, { format })
+            .pipe(fs.createWriteStream(out))
+            .on('finish', resolve)
+            .on('error', reject);
+        });
+        await writeJob(id, { status:'done', progress:100, files:{ videoPath: out } });
+      }catch(e){ console.error('download failed', e); await writeJob(id, { status:'failed', progress:100, error: String(e?.message||e) }); }
+    })();
+  }catch(e){ console.error(e); return res.status(500).json({ error:'jobs failed' }); }
+});
+
+// 조회: /jobs/:id → { status, files: { videoUrl? } }
 app.get('/jobs/:id', async (req,res)=>{
   const j = await readJob(req.params.id);
-  if(!j) return res.status(404).json({error:'not found'});
-  const files = j.files||{}; const out = { ...j };
+  if(!j) return res.status(404).json({ error:'not found' });
+  const files = j.files || {};
+  const out = { ...j };
   out.files = { ...files };
   if(files.videoPath) out.files.videoUrl = toUrl(files.videoPath);
-  if(files.ttsPath) out.files.tts = { stitchedMp3Url: toUrl(files.ttsPath) };
-  if(files.editableLinesPath && !files.editableLines){
-    out.files.editableLines = JSON.parse(await fs.readFile(files.editableLinesPath,'utf8'));
-  }
-  if(files.outputPath) out.files.downloadUrl = toUrl(files.outputPath);
   res.json(out);
 });
 
-// 3) 라인 수정 → 재합성
-app.patch('/jobs/:id/captions/:lineId', async (req,res)=>{
-  try{
-    const { id, lineId } = { id:req.params.id, lineId:req.params.lineId };
-    const j = await readJob(id); if(!j) return res.status(404).json({error:'not found'});
-    const p = j.files?.editableLinesPath; if(!p) return res.status(400).json({error:'lines missing'});
-    const lines = JSON.parse(await fs.readFile(p,'utf8'));
-    const idx = lines.findIndex(x=> x.id===lineId);
-    if(idx<0) return res.status(404).json({error:'line not found'});
-    lines[idx].text = String(req.body?.text || '');
-    await fs.writeFile(p, JSON.stringify(lines,null,2));
-
-    const voices = await azureVoices();
-    const shortName = pickVoiceShortName(voices, j.voiceId||'ko/female_basic');
-    const ssml = buildStitchedSSML(lines, shortName, {style:'general', pitch:0, rate:100});
-    const buf = await azureSynthesizeSSML(ssml);
-    const ttsMp3 = path.join(jobDir(id),'tts.mp3');
-    await fs.writeFile(ttsMp3, buf);
-    await writeJob(id, { files:{ ...j.files, editableLinesPath: p, ttsPath: ttsMp3 } });
-    return res.json({ ok:true, ttsUrl: toUrl(ttsMp3) });
-  }catch(e){ console.error(e); res.status(500).json({error:'patch failed'}); }
-});
-
-// 4) 보이스 변경 → 재합성
-app.put('/jobs/:id/voice', async (req,res)=>{
-  try{
-    const id = req.params.id; const { voiceId='ko/female_basic' } = req.body||{};
-    const j = await readJob(id); if(!j) return res.status(404).json({error:'not found'});
-    const p = j.files?.editableLinesPath; if(!p) return res.status(400).json({error:'lines missing'});
-    const lines = JSON.parse(await fs.readFile(p,'utf8'));
-    const voices = await azureVoices();
-    const shortName = pickVoiceShortName(voices, voiceId);
-    const ssml = buildStitchedSSML(lines, shortName, {style:'general', pitch:0, rate:100});
-    const buf = await azureSynthesizeSSML(ssml);
-    const ttsMp3 = path.join(jobDir(id),'tts.mp3');
-    await fs.writeFile(ttsMp3, buf);
-    const next = await writeJob(id, { voiceId, files:{ ...j.files, editableLinesPath: p, ttsPath: ttsMp3 } });
-    return res.json({ ok:true, voiceId: next.voiceId, ttsUrl: toUrl(ttsMp3) });
-  }catch(e){ console.error(e); res.status(500).json({error:'voice change failed'}); }
-});
-
-// 5) 렌더(원본+TTS 득킹 믹스) — FFmpeg 사용
-app.post('/jobs/:id/render', async (req,res)=>{
-  try{
-    const id=req.params.id; const j=await readJob(id); if(!j) return res.status(404).json({error:'not found'});
-    const vid=j.files?.videoPath, tts=j.files?.ttsPath; if(!(vid && tts)) return res.status(400).json({error:'video/tts missing'});
-    const out=path.join(jobDir(id),'out.mp4');
-    const args=['-y','-i',vid,'-i',tts,
-      '-filter_complex','[0:a]volume=0.35[a0];[a0][1:a]amix=inputs=2:duration=first:dropout_transition=0[m]',
-      '-map','0:v','-map','[m]','-c:v','copy','-c:a','aac','-b:a','192k', out];
-    await runFfmpeg(args);
-    await writeJob(id,{ files:{ ...j.files, outputPath: out } });
-    res.json({ downloadUrl: toUrl(out) });
-  }catch(e){ console.error(e); res.status(500).json({error:'render failed', detail:String(e?.message||e)}); }
-});
-
-app.get('/ffmpeg', (req, res) => {
-  try {
-    const p = spawn(FFMPEG, ['-version']);
-    let out = '';
-    p.stdout.on('data', d => out += d.toString());
-    p.stderr.on('data', d => out += d.toString());
-    p.on('close', code => {
-      res
-        .status(code === 0 ? 200 : 500)
-        .json({ ok: code === 0, cmd: FFMPEG, version: out.split('\n')[0] || out.trim() });
-    });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: String(e?.message || e) });
-  }
-});
-
-app.listen(PORT, async ()=>{ await ensureDir(DATA_DIR); console.log(`API ready on :${PORT}`); });
+app.listen(PORT, async ()=>{ await ensureDir(DATA_DIR); console.log(`Simple API ready on http://localhost:${PORT}`); });
