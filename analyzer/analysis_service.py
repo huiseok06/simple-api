@@ -117,14 +117,10 @@ def extract_frames_per_second(video_path: str, fps: int = 1):
 
 def get_major_key_events(R: ResilientGemini, frames):
     parts = [
-        "당신은 스포츠 영상의 하이라이트만 뽑아내는 스토리 분석가입니다.
-",
-        "JSON 배열 하나만 출력:
-",
-        '[{"start":초, "event_description":"..."}]
-',
-        "--- 프레임 목록 ---
-"
+        "당신은 스포츠 영상의 하이라이트만 뽑아내는 스토리 분석가입니다.",
+        "JSON 배열 하나만 출력:",
+        '[{"start":초, "event_description":"..."}]',
+        "--- 프레임 목록 ---"
     ]
     for f in frames:
         uf = R.upload_file_retry(f["path"], "image/jpeg")
@@ -156,14 +152,10 @@ def fill_gaps(R: ResilientGemini, timeline, frames, max_gap=10):
             gap_frames = [f for f in frames if cur["start"] < f["time"] < nxt["start"]]
             if not gap_frames: continue
             parts = [
-                f"{cur['start']}초와 {nxt['start']}초 사이 공백을 메우세요.
-",
-                "5~10초 간격의 보조 사건을 JSON 배열로만:
-",
-                '[{"start":초,"event_description":"..."}]
-',
-                "--- 이 구간 프레임들 ---
-"
+                f"{cur['start']}초와 {nxt['start']}초 사이 공백을 메우세요.",
+                "5~10초 간격의 보조 사건을 JSON 배열로만:",
+                '[{"start":초,"event_description":"..."}]',
+                "--- 이 구간 프레임들 ---"
             ]
             for f in gap_frames:
                 uf = R.upload_file_retry(f["path"], "image/jpeg")
@@ -193,14 +185,10 @@ def script_from_timeline(R: ResilientGemini, timeline):
         available = (timeline[i+1]["start"] - cur["start"]) if i < len(timeline)-1 else 8
         if available <= 0: continue
         prompt = [
-            "아래 사건에 대한 해설 대사를 작성하고, 해당 길이를 주어진 시간 안에 말하기 위한 적정 배속(rate)을 계산하세요.
-",
-            'JSON 한 개: {"text":"...", "rate":숫자}
-',
-            f"사건: {cur['start']}초 - {cur['event_description']}
-",
-            f"시간제한: {float(available):.2f}초
-"
+            "아래 사건에 대한 해설 대사를 작성하고, 해당 길이를 주어진 시간 안에 말하기 위한 적정 배속(rate)을 계산하세요.",
+            'JSON 한 개: {"text":"...", "rate":숫자}',
+            f"사건: {cur['start']}초 - {cur['event_description']}",
+            f"시간제한: {float(available):.2f}초"
         ]
         try:
             js = R.generate_json_retry(prompt, timeout=180)
