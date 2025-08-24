@@ -1,0 +1,6 @@
+opencv-python-headless
+pillow
+numpy
+pydub
+requests
+google-generativeai
