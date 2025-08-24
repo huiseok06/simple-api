@@ -29,43 +29,69 @@ app.use('/files', express.static(DATA_DIR));
 app.get('/health', (req, res) => res.json({ ok: true, time: Date.now() }));
 
 // ---------- Python analyzer runner ----------
-// ---------- Python analyzer runner ----------
 // 아래 전체 함수로 교체
 const DEFAULT_VOICE = process.env.TOPMEDIA_VOICE || 'ko_female_basic';
 
 function runPythonAnalyze({ videoPath, outDir, voiceId }) {
+  const resultPath = path.join(outDir, 'result.json');
+
+  async function readJsonWithRetry(p, tries = 12, delayMs = 300) {
+    for (let i = 0; i < tries; i++) {
+      try {
+        const txt = await fs.readFile(p, 'utf-8');
+        if (txt && txt.trim().length > 0) {
+          const j = JSON.parse(txt);
+          return j;
+        }
+      } catch (e) {
+        // ignore
+      }
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+    throw new Error('result.json missing or empty after retries');
+  }
+
   return new Promise((resolve, reject) => {
-    const py = spawn('python3', [
-      'analyzer/analysis_service.py',
-      '--video', videoPath,
-      '--outdir', outDir,
-      '--fps', '1',
-      '--max_gap', '10',
-      '--model', 'gemini-1.5-pro-latest',
-      '--voiceId', voiceId || DEFAULT_VOICE
-    ], {
-      env: { ...process.env, PYTHONUNBUFFERED: '1' }, // ← 무버퍼
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
+    const py = spawn(
+      'python3',
+      [
+        'analyzer/analysis_service.py',
+        '--video',
+        videoPath,
+        '--outdir',
+        outDir,
+        '--fps',
+        '1',
+        '--max_gap',
+        '10',
+        '--model',
+        'gemini-1.5-pro-latest',
+        '--voiceId',
+        voiceId || DEFAULT_VOICE,
+      ],
+      { env: { ...process.env, PYTHONUNBUFFERED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] }
+    );
 
     let out = '';
     let err = '';
-    py.stdout.on('data', d => (out += d.toString()));
-    py.stderr.on('data', d => (err += d.toString()));
+    py.stdout.on('data', (d) => (out += d.toString()));
+    py.stderr.on('data', (d) => (err += d.toString()));
 
     py.on('close', async (code) => {
-      if (code !== 0) {
-        return reject(new Error(err || `python exited ${code}`));
-      }
       try {
-        // stdout이 비었으면 파일 fallback
-        if (!out.trim()) {
-          const jf = path.join(outDir, 'result.json');
-          const txt = await fs.readFile(jf, 'utf-8');
-          return resolve(JSON.parse(txt));
+        // 1) 가장 신뢰도 높은 경로: 파일을 읽는다(재시도 포함)
+        const j = await readJsonWithRetry(resultPath);
+
+        // 2) 파이썬이 에러 JSON을 남긴 경우
+        if (j && j.status === 'error') {
+          const msg = `${j.message || 'python error'} :: ${String(j.trace || '').slice(0, 400)}`;
+          return reject(new Error(msg));
         }
-        return resolve(JSON.parse(out));
+
+        // 3) 정상 결과
+        return resolve(j);
       } catch (e) {
+        // 파일이 없거나 비었을 때: stdout/stderr로 힌트 제공
         const snippet = (out || err || '').toString().slice(0, 800);
         return reject(new Error(`invalid JSON from python: ${e}\n---\n${snippet}`));
       }
