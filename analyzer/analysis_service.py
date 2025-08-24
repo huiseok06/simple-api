@@ -122,3 +122,21 @@ class ResilientGemini:
                 except Exception: pass
                 _backoff_sleep(i, base=backoff_base)
         raise RuntimeError(f"generate_json_retry failed: {last_err}")
+
+out = {
+    "timeline": timeline,
+    "lines": lines,
+    "script": script_text,
+    "duration_sec": round(float(duration), 3),
+    "tts_path": tts_path
+}
+
+# 결과를 파일에도 저장 (Node가 fallback으로 읽음)
+out_json = os.path.join(args.outdir, "result.json")
+with open(out_json, "w", encoding="utf-8") as f:
+    json.dump(out, f, ensure_ascii=False)
+    f.flush()
+    os.fsync(f.fileno())
+
+# stdout에도 출력 (무버퍼 모드에서 바로 전달)
+print(json.dumps(out, ensure_ascii=False), flush=True)

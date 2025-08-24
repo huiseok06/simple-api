@@ -29,6 +29,8 @@ app.use('/files', express.static(DATA_DIR));
 app.get('/health', (req, res) => res.json({ ok: true, time: Date.now() }));
 
 // ---------- Python analyzer runner ----------
+// ---------- Python analyzer runner ----------
+// 아래 전체 함수로 교체
 const DEFAULT_VOICE = process.env.TOPMEDIA_VOICE || 'ko_female_basic';
 
 function runPythonAnalyze({ videoPath, outDir, voiceId }) {
@@ -42,67 +44,31 @@ function runPythonAnalyze({ videoPath, outDir, voiceId }) {
       '--model', 'gemini-1.5-pro-latest',
       '--voiceId', voiceId || DEFAULT_VOICE
     ], {
-      env: { ...process.env },
+      env: { ...process.env, PYTHONUNBUFFERED: '1' }, // ← 무버퍼
       stdio: ['ignore', 'pipe', 'pipe']
     });
+
     let out = '';
     let err = '';
-    py.stdout.on('data', d => out += d.toString());
-    py.stderr.on('data', d => err += d.toString());
-    py.on('close', code => {
-      if (code !== 0) return reject(new Error(err || `python exited ${code}`));
-      try { resolve(JSON.parse(out)); }
-      catch (e) { reject(new Error(`invalid JSON from python: ${e}\n---\n${out}`)); }
+    py.stdout.on('data', d => (out += d.toString()));
+    py.stderr.on('data', d => (err += d.toString()));
+
+    py.on('close', async (code) => {
+      if (code !== 0) {
+        return reject(new Error(err || `python exited ${code}`));
+      }
+      try {
+        // stdout이 비었으면 파일 fallback
+        if (!out.trim()) {
+          const jf = path.join(outDir, 'result.json');
+          const txt = await fs.readFile(jf, 'utf-8');
+          return resolve(JSON.parse(txt));
+        }
+        return resolve(JSON.parse(out));
+      } catch (e) {
+        const snippet = (out || err || '').toString().slice(0, 800);
+        return reject(new Error(`invalid JSON from python: ${e}\n---\n${snippet}`));
+      }
     });
   });
 }
-
-// ---------- upload route ----------
-const storage = multer.diskStorage({
-  destination: async (req, file, cb) => {
-    try {
-      const id = crypto.randomBytes(6).toString('hex') + '-' + Date.now().toString(36);
-      req.uploadId = id;
-      const dir = jobDir(id);
-      await ensureDir(dir);
-      cb(null, dir);
-    } catch (e) {
-      cb(e);
-    }
-  },
-  filename: (req, file, cb) => cb(null, 'video.mp4')
-});
-const upload = multer({ storage });
-
-// POST /upload  (multipart/form-data; fields: video, [voiceId])
-app.post('/upload', upload.single('video'), async (req, res) => {
-  try {
-    const id = req.uploadId || crypto.randomBytes(6).toString('hex');
-    const dir = jobDir(id);
-    const videoPath = path.join(dir, 'video.mp4');
-    const voiceId = (req.body && req.body.voiceId) || (req.query && req.query.voiceId) || process.env.TOPMEDIA_VOICE;
-
-    // run analyzer (Gemini + TopMediaAI stitched mp3)
-    const result = await runPythonAnalyze({ videoPath, outDir: dir, voiceId });
-    // result: { timeline, lines, script, duration_sec, tts_path }
-
-    return res.json({
-      jobId: id,
-      videoUrl: toUrl(videoPath),
-      ttsUrl: toUrl(result.tts_path),
-      script: result.script,
-      lines: result.lines,
-      timeline: result.timeline,
-      durationSec: result.duration_sec,
-      status: 'ready'
-    });
-  } catch (e) {
-    console.error('upload failed', e);
-    res.status(500).json({ error: 'upload/analysis failed', detail: String(e?.message || e) });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`SIMPLE-API listening on ${PORT}`);
-  console.log(`Static files at ${PUBLIC_BASE_URL}/files/...`);
-});
