@@ -7,17 +7,16 @@
 #   - TOPMEDIA_API_KEY (필수)
 #   - [옵션] TOPMEDIA_API_URL, TOPMEDIA_AUTH_STYLE("Bearer" | "x-api-key"), TOPMEDIA_VOICE
 
-from typing import Optional
-import os, sys, json, time, argparse, tempfile, random
+import os, sys, json, time, argparse, tempfile, random, base64
 from http.client import RemoteDisconnected
+from typing import Optional
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image  # noqa: F401  (보류; 필요시 사용)
 import requests
 from pydub import AudioSegment
 import google.generativeai as genai
-
 
 # ------------------------ 공통 유틸 ------------------------
 
@@ -30,11 +29,9 @@ def write_json_atomic(path: str, obj: dict):
         os.fsync(f.fileno())
     os.replace(tmp, path)  # atomic replace
 
-
 def _backoff_sleep(i: int, base: float = 1.0, cap: float = 20.0):
     wait = min(cap, base * (2 ** i)) + random.random()
     time.sleep(wait)
-
 
 def _clean_json_text(text: str) -> str:
     if not text:
@@ -42,11 +39,9 @@ def _clean_json_text(text: str) -> str:
     t = text.strip().replace("```json", "").replace("```", "").strip()
     return t
 
-
 def _is_rate_limit(e: Exception) -> bool:
     s = str(e).lower()
     return any(k in s for k in ["429", "rate limit", "quota", "resource exhausted"])
-
 
 def _should_retry_exception(e: Exception) -> bool:
     if isinstance(e, (ConnectionError, TimeoutError, RemoteDisconnected, ConnectionResetError)):
@@ -57,7 +52,6 @@ def _should_retry_exception(e: Exception) -> bool:
     if _is_rate_limit(e):
         return True
     return False
-
 
 # ------------------------ Gemini 래퍼(강화판) ------------------------
 
@@ -119,7 +113,6 @@ class ResilientGemini:
         for i in range(retries):
             try:
                 resp = self.model.generate_content(parts, request_options={"timeout": tmo})
-
                 text = (getattr(resp, "text", None) or "").strip()
                 if not text:
                     # candidates에서 끌어오기
@@ -134,21 +127,18 @@ class ResilientGemini:
                             text = "".join(pieces).strip()
                     except Exception:
                         pass
-
                 if not text:
                     pf = getattr(resp, "prompt_feedback", None)
                     raise RuntimeError(
                         f"Gemini returned empty response. "
                         f"Check GEMINI_API_KEY / quota / safety. prompt_feedback={pf}"
                     )
-
                 cleaned = _clean_json_text(text)
                 try:
                     return json.loads(cleaned)
                 except Exception as je:
                     preview = cleaned[:400]
                     raise RuntimeError(f"Gemini non-JSON response preview: {preview}") from je
-
             except Exception as e:
                 last_err = e
                 if not _should_retry_exception(e):
@@ -159,7 +149,6 @@ class ResilientGemini:
                     pass
                 _backoff_sleep(i, base=backoff_base)
         raise RuntimeError(f"generate_json_retry failed: {last_err}")
-
 
 # ------------------------ 분석 파이프라인 ------------------------
 
@@ -199,7 +188,6 @@ def extract_frames_per_second(video_path: str, fps: int = 1):
     cap.release()
     return frames, float(duration_sec)
 
-
 def get_major_key_events(R: ResilientGemini, frames):
     """주요 하이라이트 타임라인 추출."""
     if not frames:
@@ -231,14 +219,13 @@ def get_major_key_events(R: ResilientGemini, frames):
         events.append({"start": st, "event_description": desc or "주요 하이라이트"})
     events.sort(key=lambda x: x["start"])
 
-    # 안전장치: 비어있으면 5초 간격으로 최소 1개 생성
+    # 안전장치: 비어있으면 중간점 1개라도
     if not events and frames:
         t0 = frames[0]["time"]
         t1 = frames[-1]["time"]
         mid = int((t0 + t1) // 2)
         events = [{"start": max(0, mid), "event_description": "주요 하이라이트"}]
     return events
-
 
 def fill_gaps(R: ResilientGemini, timeline, frames, max_gap=10):
     """긴 공백 구간을 보조 사건으로 채움."""
@@ -294,7 +281,6 @@ def fill_gaps(R: ResilientGemini, timeline, frames, max_gap=10):
     tmp = {e["start"]: e for e in out}
     return sorted(tmp.values(), key=lambda x: x["start"])
 
-
 def script_from_timeline(R: ResilientGemini, timeline):
     """각 사건에 맞는 해설 대사 + rate 생성."""
     if not timeline:
@@ -320,15 +306,10 @@ def script_from_timeline(R: ResilientGemini, timeline):
             lines.append({"id": f"e{i}", "start": int(cur["start"]), "text": cur["event_description"], "rate": 1.0})
     return lines
 
-
-# ------------------------ TopMediaAI TTS ------------------------
 # ------------------------ TopMediaAI TTS (v1: text2speech) ------------------------
-# ------------------------ TopMediaAI TTS (v1: text2speech) ------------------------
-import base64
 
 TOPMEDIA_TTS_API = os.environ.get("TOPMEDIA_API_URL", "https://api.topmediai.com/v1/text2speech")
 TOPMEDIA_VOICES_API = "https://api.topmediai.com/v1/voices_list"
-
 _SPEAKER_CACHE = None
 
 def _fetch_voices(key: str):
@@ -373,7 +354,6 @@ def topmedia_speak(text: str, voice: str) -> bytes:
         raise RuntimeError("TOPMEDIA_API_KEY missing")
 
     speaker = resolve_speaker_id(voice, key)
-
     payload = {"text": text, "speaker": speaker, "emotion": "Neutral"}
     headers = {"Content-Type": "application/json", "x-api-key": key}
 
@@ -396,6 +376,28 @@ def topmedia_speak(text: str, voice: str) -> bytes:
     # audio/* 직접 바이트
     return r.content
 
+def synthesize_timeline_mp3(lines, out_path: str, voice: str):
+    """각 줄을 개별로 합성해 start초에 맞춰 오버레이 → 하나의 mp3."""
+    segments = []
+    max_end_ms = 0
+    from io import BytesIO
+
+    for ln in lines:
+        audio = topmedia_speak(ln["text"], voice)
+        seg = AudioSegment.from_file(BytesIO(audio), format="mp3")
+        start_ms = int(ln["start"] * 1000)
+        segments.append((start_ms, seg))
+        max_end_ms = max(max_end_ms, start_ms + len(seg))
+
+    if not segments:
+        raise RuntimeError("no TTS segments")
+
+    timeline = AudioSegment.silent(duration=max_end_ms + 1000)
+    for start_ms, seg in segments:
+        timeline = timeline.overlay(seg, position=start_ms)
+
+    timeline.export(out_path, format="mp3")
+    return out_path
 
 # ------------------------ main ------------------------
 
@@ -460,7 +462,6 @@ def main():
         write_json_atomic(out_json, err)
         print(json.dumps(err, ensure_ascii=False), flush=True)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
