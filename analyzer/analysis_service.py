@@ -321,42 +321,78 @@ def script_from_timeline(R: ResilientGemini, timeline):
 
 
 # ------------------------ TopMediaAI TTS ------------------------
+# ------------------------ TopMediaAI TTS (v1: text2speech) ------------------------
+import base64
+
+TOPMEDIA_TTS_API = os.environ.get("TOPMEDIA_API_URL", "https://api.topmediai.com/v1/text2speech")
+TOPMEDIA_VOICES_API = "https://api.topmediai.com/v1/voices_list"
+
+_SPEAKER_CACHE = None
+
+def _fetch_voices(key: str):
+    r = requests.get(TOPMEDIA_VOICES_API, headers={"x-api-key": key}, timeout=60)
+    r.raise_for_status()
+    if "application/json" in (r.headers.get("content-type") or ""):
+        j = r.json()
+        return (j.get("Voice") or []) if isinstance(j, dict) else []
+    return []
+
+def resolve_speaker_id(desired: str | None, key: str) -> str:
+    """
+    desired가 스피커 UUID면 그대로, 아니면 보이스 목록에서 name/urlname으로 매핑.
+    없으면 한국어 → 첫 번째 순으로 fallback.
+    """
+    global _SPEAKER_CACHE
+    if desired and isinstance(desired, str) and "-" in desired and len(desired) >= 8:
+        return desired  # 이미 스피커 ID 형태
+
+    if _SPEAKER_CACHE is None:
+        _SPEAKER_CACHE = _fetch_voices(key)
+
+    if desired:
+        for v in _SPEAKER_CACHE:
+            if str(v.get("urlname", "")).lower() == desired.lower() or str(v.get("name", "")).lower() == desired.lower():
+                return v.get("speaker") or v.get("modeltoken") or ""
+
+    # 한국어 우선
+    for v in _SPEAKER_CACHE or []:
+        if "korean" in str(v.get("Languagename", "")).lower():
+            return v.get("speaker") or v.get("modeltoken") or ""
+
+    # 최종 fallback: 첫 번째
+    if _SPEAKER_CACHE:
+        return _SPEAKER_CACHE[0].get("speaker") or _SPEAKER_CACHE[0].get("modeltoken") or ""
+
+    raise RuntimeError("TopMediai voices not available")
 
 def topmedia_speak(text: str, voice: str) -> bytes:
-    api = os.environ.get("TOPMEDIA_API_URL", "https://api.topmediai.com/v1/tts")
     key = os.environ.get("TOPMEDIA_API_KEY", "")
-    style = (os.environ.get("TOPMEDIA_AUTH_STYLE", "Bearer")).lower()
     if not key:
         raise RuntimeError("TOPMEDIA_API_KEY missing")
-    payload = {"text": text, "voice": voice, "format": "mp3"}
 
-    h_bearer = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
-    h_xkey = {"Content-Type": "application/json", "x-api-key": key}
+    speaker = resolve_speaker_id(voice, key)
 
-    def try_once(headers):
-        r = requests.post(api, headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
-        ct = r.headers.get("content-type", "")
-        if "application/json" in ct:
-            j = r.json()
+    payload = {"text": text, "speaker": speaker, "emotion": "Neutral"}
+    headers = {"Content-Type": "application/json", "x-api-key": key}
+
+    r = requests.post(TOPMEDIA_TTS_API, headers=headers, json=payload, timeout=120)
+    r.raise_for_status()
+
+    ct = r.headers.get("content-type", "")
+    if "application/json" in ct:
+        j = r.json()
+        if isinstance(j, dict):
             if "url" in j:
-                r2 = requests.get(j["url"], timeout=60)
+                r2 = requests.get(j["url"], timeout=120)
                 r2.raise_for_status()
                 return r2.content
-            if "audioContent" in j:  # base64
-                import base64
+            if "audio" in j:
+                return base64.b64decode(j["audio"])
+            if "audioContent" in j:
                 return base64.b64decode(j["audioContent"])
-            raise RuntimeError("unexpected JSON from TTS")
-        return r.content
-
-    try:
-        return try_once(h_bearer if style.startswith("bearer") else h_xkey)
-    except Exception as e1:
-        try:
-            return try_once(h_xkey if style.startswith("bearer") else h_bearer)
-        except Exception as e2:
-            raise RuntimeError(f"TopMediaAI failed: {e1} / {e2}")
-
+        raise RuntimeError(f"unexpected TopMediai JSON: {str(j)[:200]}")
+    # audio/* 직접 바이트
+    return r.content
 
 def synthesize_timeline_mp3(lines, out_path: str, voice: str):
     """각 줄을 개별로 합성해 start초에 맞춰 오버레이 → 하나의 mp3."""
