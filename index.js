@@ -1,4 +1,4 @@
-// index.js — SIMPLE-API 서버 (통째로 교체)
+// SIMPLE-API/index.js — 서버 메인
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs-extra';
@@ -8,14 +8,8 @@ import multer from 'multer';
 import { spawn } from 'node:child_process';
 
 // 전역 에러 로깅
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT', err);
-  process.exit(1);
-});
-process.on('unhandledRejection', (err) => {
-  console.error('UNHANDLED', err);
-  process.exit(1);
-});
+process.on('uncaughtException', (err) => { console.error('UNCAUGHT', err); process.exit(1); });
+process.on('unhandledRejection', (err) => { console.error('UNHANDLED', err); process.exit(1); });
 console.log('Booting SIMPLE-API with Node', process.version, 'PORT=', process.env.PORT);
 
 const app = express();
@@ -23,16 +17,13 @@ app.use(cors());
 app.use(express.json());
 
 // //upload 같은 2중 슬래시 정리
-app.use((req, _res, next) => {
-  req.url = req.url.replace(/\/{2,}/g, '/');
-  next();
-});
+app.use((req, _res, next) => { req.url = req.url.replace(/\/{2,}/g, '/'); next(); });
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.resolve('data');
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
-// 디렉터리 준비(동기)
+// 디렉터리 준비
 fs.ensureDirSync(DATA_DIR);
 const jobDir = (id) => path.join(DATA_DIR, id);
 const toUrl = (absPath) => {
@@ -40,7 +31,7 @@ const toUrl = (absPath) => {
   return `${PUBLIC_BASE_URL}/files/${rel}`;
 };
 
-// 정적 파일 서빙
+// 정적 파일
 app.use('/files', express.static(DATA_DIR));
 
 app.get('/health', (_req, res) => res.json({ ok: true, time: Date.now() }));
@@ -55,9 +46,7 @@ function runPythonAnalyze({ videoPath, outDir, voiceId }) {
     for (let i = 0; i < tries; i++) {
       try {
         const txt = await fs.readFile(p, 'utf-8');
-        if (txt && txt.trim().length > 0) {
-          return JSON.parse(txt);
-        }
+        if (txt && txt.trim().length > 0) return JSON.parse(txt);
       } catch {}
       await new Promise((r) => setTimeout(r, delayMs));
     }
@@ -69,28 +58,21 @@ function runPythonAnalyze({ videoPath, outDir, voiceId }) {
       'python3',
       [
         'analyzer/analysis_service.py',
-        '--video',
-        videoPath,
-        '--outdir',
-        outDir,
-        '--fps',
-        '1',
-        '--max_gap',
-        '10',
-        '--model',
-        'gemini-1.5-pro-latest',
-        '--voiceId',
-        voiceId || DEFAULT_VOICE
+        '--video', videoPath,
+        '--outdir', outDir,
+        '--fps', '1',
+        '--max_gap', '10',
+        '--model', 'gemini-1.5-pro-latest',
+        '--voiceId', voiceId || DEFAULT_VOICE
       ],
       { env: { ...process.env, PYTHONUNBUFFERED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] }
     );
 
-    let out = '';
-    let err = '';
+    let out = '', err = '';
     py.stdout.on('data', (d) => (out += d.toString()));
     py.stderr.on('data', (d) => (err += d.toString()));
 
-    py.on('close', async (_code) => {
+    py.on('close', async () => {
       try {
         const j = await readJsonWithRetry(resultPath);
         if (j && j.status === 'error') {
@@ -114,11 +96,11 @@ const storage = multer.diskStorage({
     const dir = jobDir(id);
     fs.ensureDir(dir).then(() => cb(null, dir)).catch(cb);
   },
-  filename: (_req, file, cb) => cb(null, 'video.mp4')
+  filename: (_req, _file, cb) => cb(null, 'video.mp4')
 });
 const upload = multer({ storage });
 
-// POST /upload  (multipart/form-data; fields: video, [voiceId])
+// POST /upload (multipart/form-data; fields: video, [voiceId])
 app.post('/upload', upload.single('video'), async (req, res) => {
   try {
     const id = req.uploadId || crypto.randomBytes(6).toString('hex');
