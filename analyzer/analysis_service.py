@@ -7,6 +7,7 @@
 #   - TOPMEDIA_API_KEY (필수)
 #   - [옵션] TOPMEDIA_API_URL, TOPMEDIA_AUTH_STYLE("Bearer" | "x-api-key"), TOPMEDIA_VOICE
 
+from typing import Optional
 import os, sys, json, time, argparse, tempfile, random
 from http.client import RemoteDisconnected
 
@@ -322,6 +323,7 @@ def script_from_timeline(R: ResilientGemini, timeline):
 
 # ------------------------ TopMediaAI TTS ------------------------
 # ------------------------ TopMediaAI TTS (v1: text2speech) ------------------------
+# ------------------------ TopMediaAI TTS (v1: text2speech) ------------------------
 import base64
 
 TOPMEDIA_TTS_API = os.environ.get("TOPMEDIA_API_URL", "https://api.topmediai.com/v1/text2speech")
@@ -337,7 +339,7 @@ def _fetch_voices(key: str):
         return (j.get("Voice") or []) if isinstance(j, dict) else []
     return []
 
-def resolve_speaker_id(desired: str | None, key: str) -> str:
+def resolve_speaker_id(desired: Optional[str], key: str) -> str:
     """
     desired가 스피커 UUID면 그대로, 아니면 보이스 목록에서 name/urlname으로 매핑.
     없으면 한국어 → 첫 번째 순으로 fallback.
@@ -350,7 +352,7 @@ def resolve_speaker_id(desired: str | None, key: str) -> str:
         _SPEAKER_CACHE = _fetch_voices(key)
 
     if desired:
-        for v in _SPEAKER_CACHE:
+        for v in _SPEAKER_CACHE or []:
             if str(v.get("urlname", "")).lower() == desired.lower() or str(v.get("name", "")).lower() == desired.lower():
                 return v.get("speaker") or v.get("modeltoken") or ""
 
@@ -393,29 +395,6 @@ def topmedia_speak(text: str, voice: str) -> bytes:
         raise RuntimeError(f"unexpected TopMediai JSON: {str(j)[:200]}")
     # audio/* 직접 바이트
     return r.content
-
-def synthesize_timeline_mp3(lines, out_path: str, voice: str):
-    """각 줄을 개별로 합성해 start초에 맞춰 오버레이 → 하나의 mp3."""
-    segments = []
-    max_end_ms = 0
-    from io import BytesIO
-
-    for ln in lines:
-        audio = topmedia_speak(ln["text"], voice)
-        seg = AudioSegment.from_file(BytesIO(audio), format="mp3")
-        start_ms = int(ln["start"] * 1000)
-        segments.append((start_ms, seg))
-        max_end_ms = max(max_end_ms, start_ms + len(seg))
-
-    if not segments:
-        raise RuntimeError("no TTS segments")
-
-    timeline = AudioSegment.silent(duration=max_end_ms + 1000)
-    for start_ms, seg in segments:
-        timeline = timeline.overlay(seg, position=start_ms)
-
-    timeline.export(out_path, format="mp3")
-    return out_path
 
 
 # ------------------------ main ------------------------
