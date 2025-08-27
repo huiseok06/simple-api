@@ -353,37 +353,22 @@ def topmedia_speak(text: str, voice: str) -> bytes:
 # ... (상단 import/유틸/ResilientGemini/파이프라인/TopMediai TTS는 이전 답변의 "완전판" 그대로) ...
 
 def synthesize_timeline_mp3(lines, out_path: str, voice: str):
+    # (이전 완전판 동일)
     from io import BytesIO
-    segments = []
+    segments, max_end_ms = [], 0
     for ln in lines:
         audio = topmedia_speak(ln["text"], voice)
         seg = AudioSegment.from_file(BytesIO(audio), format="mp3")
         start_ms = int(ln["start"] * 1000)
         segments.append((start_ms, seg))
-
+        max_end_ms = max(max_end_ms, start_ms + len(seg))
     if not segments:
         raise RuntimeError("no TTS segments")
-
-    # ① 시작 시간 기준 정렬
-    segments.sort(key=lambda x: x[0])
-
-    # ② 겹침 금지: 이전 구간 끝보다 이르면 뒤로 밀어붙임
-    safe_segments = []
-    cursor = 0
+    timeline = AudioSegment.silent(duration=max_end_ms + 1000)
     for start_ms, seg in segments:
-        start_ms = max(start_ms, cursor)
-        safe_segments.append((start_ms, seg))
-        cursor = start_ms + len(seg)
-
-    # ③ 합성
-    total = safe_segments[-1][0] + len(safe_segments[-1][1]) + 1000
-    timeline = AudioSegment.silent(duration=total)
-    for start_ms, seg in safe_segments:
         timeline = timeline.overlay(seg, position=start_ms)
-
     timeline.export(out_path, format="mp3")
     return out_path
-
 
 # ------------------------ main ------------------------
 def main():
