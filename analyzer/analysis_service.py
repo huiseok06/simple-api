@@ -349,10 +349,13 @@ def topmedia_speak(text: str, voice: str) -> bytes:
         raise RuntimeError(f"unexpected TopMediai JSON type: {type(j)}")
 
     return r.content
+# analyzer/analysis_service.py  (요약: 이전 완전판과 동일 + --lines_path 지원)
+# ... (상단 import/유틸/ResilientGemini/파이프라인/TopMediai TTS는 이전 답변의 "완전판" 그대로) ...
 
 def synthesize_timeline_mp3(lines, out_path: str, voice: str):
-    segments, max_end_ms = [], 0
+    # (이전 완전판 동일)
     from io import BytesIO
+    segments, max_end_ms = [], 0
     for ln in lines:
         audio = topmedia_speak(ln["text"], voice)
         seg = AudioSegment.from_file(BytesIO(audio), format="mp3")
@@ -368,15 +371,15 @@ def synthesize_timeline_mp3(lines, out_path: str, voice: str):
     return out_path
 
 # ------------------------ main ------------------------
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--video", required=True)
+    ap.add_argument("--video")  # lines_path 모드에서는 optional
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--fps", type=int, default=1)
     ap.add_argument("--max_gap", type=int, default=10)
     ap.add_argument("--model", default="gemini-1.5-pro-latest")
     ap.add_argument("--voiceId", default=os.environ.get("TOPMEDIA_VOICE", "ko_female_basic"))
+    ap.add_argument("--lines_path")  # ← 추가: 라인 JSON 주면 재합성만
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -384,6 +387,29 @@ def main():
     write_json_atomic(out_json, {"status": "started"})
 
     try:
+        # 재합성 모드: lines만 가지고 TTS 만들기
+        if args.lines_path:
+            if not os.path.exists(args.lines_path):
+                raise RuntimeError("lines_path not found")
+            with open(args.lines_path, "r", encoding="utf-8") as f:
+                lines = json.load(f)
+            tts_path = os.path.join(args.outdir, "tts.mp3")
+            synthesize_timeline_mp3(lines, tts_path, voice=args.voiceId)
+            # 기존 result.json 유지 + tts_path만 업데이트
+            base = {}
+            if os.path.exists(out_json):
+                try:
+                    base = json.load(open(out_json, "r", encoding="utf-8"))
+                except Exception:
+                    base = {}
+            base.update({"status": "done", "tts_path": tts_path})
+            write_json_atomic(out_json, base)
+            print(json.dumps(base, ensure_ascii=False), flush=True)
+            return
+
+        # 분석 모드(비전 + 제미니 + TTS)
+        if not args.video:
+            raise RuntimeError("video required when lines_path not provided")
         gemini_key = os.environ.get("GEMINI_API_KEY")
         if not gemini_key:
             raise RuntimeError("GEMINI_API_KEY missing")
