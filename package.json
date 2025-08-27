@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --trace-uncaught index.js"
+    "start": "node --trace-uncaught simple-api/index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
