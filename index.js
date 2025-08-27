@@ -1,4 +1,4 @@
-// SIMPLE-API/index.js — 서버 메인
+// simple-api/index.js — 통째로 교체본
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs-extra';
@@ -9,18 +9,16 @@ import { spawn } from 'node:child_process';
 
 process.on('uncaughtException', (err) => { console.error('UNCAUGHT', err); process.exit(1); });
 process.on('unhandledRejection', (err) => { console.error('UNHANDLED', err); process.exit(1); });
-console.log('Booting SIMPLE-API with Node', process.version, 'PORT=', process.env.PORT);
 
 const app = express();
 app.use(cors());
-app.use(express.json());
-
-// //upload 같은 2중 슬래시 정리
+app.use(express.json({ limit: '10mb' }));
 app.use((req, _res, next) => { req.url = req.url.replace(/\/{2,}/g, '/'); next(); });
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.resolve('data');
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+const DEFAULT_VOICE = process.env.TOPMEDIA_VOICE || 'ko_female_basic';
 
 fs.ensureDirSync(DATA_DIR);
 const jobDir = (id) => path.join(DATA_DIR, id);
@@ -32,125 +30,101 @@ const toUrl = (absPath) => {
 app.use('/files', express.static(DATA_DIR));
 app.get('/health', (_req, res) => res.json({ ok: true, time: Date.now() }));
 
-// ---------- Python analyzer runner ----------
-const DEFAULT_VOICE = process.env.TOPMEDIA_VOICE || 'ko_female_basic';
+// 업로드 스토리지
+const storage = multer.diskStorage({
+  destination(_req, _file, cb) { fs.ensureDirSync(DATA_DIR); cb(null, DATA_DIR); },
+  filename(_req, file, cb) {
+    const name = file.originalname?.replace(/[^a-zA-Z0-9_.-]+/g, '_') || 'video.mp4';
+    cb(null, `${Date.now()}_${name}`);
+  }
+});
+const upload = multer({ storage });
 
-function runPythonAnalyze({ videoPath, outDir, voiceId }) {
-  const resultPath = path.join(outDir, 'result.json');
-
-  async function readJsonWithRetry(p, tries = 12, delayMs = 300) {
-    for (let i = 0; i < tries; i++) {
+// ---------- Python runner ----------
+function readJsonWithRetry(p, tries = 20, delayMs = 300) {
+  return new Promise((resolve, reject) => {
+    let i = 0;
+    const tick = async () => {
       try {
         const txt = await fs.readFile(p, 'utf-8');
-        if (txt && txt.trim().length > 0) return JSON.parse(txt);
+        if (txt && txt.trim().length > 0) return resolve(JSON.parse(txt));
       } catch {}
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-    throw new Error('result.json missing or empty after retries');
-  }
+      if (++i >= tries) return reject(new Error('result.json missing or empty after retries'));
+      setTimeout(tick, delayMs);
+    };
+    tick();
+  });
+}
 
+function runPythonAnalyze({ videoPath, outDir, voiceId, fast }) {
   return new Promise((resolve, reject) => {
-    const py = spawn(
-      'python3',
-      [
-        'analyzer/analysis_service.py',
-        ...(videoPath ? ['--video', videoPath] : []),
-        '--outdir', outDir,
-        '--fps', '1',
-        '--max_gap', '10',
-        '--model', 'gemini-1.5-pro-latest',
-        '--voiceId', voiceId || DEFAULT_VOICE
-      ],
-      { env: { ...process.env, PYTHONUNBUFFERED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] }
-    );
+    const pyArgs = [
+      'analysis_service.py',
+      '--video', videoPath,
+      '--outdir', outDir,
+      '--voiceId', voiceId || DEFAULT_VOICE,
+      ...(fast ? ['--fps','0','--model','gemini-1.5-flash'] : ['--fps','1','--model','gemini-1.5-pro-latest'])
+    ];
+
+    const py = spawn('python3', pyArgs, { cwd: process.cwd(), env: { ...process.env, PYTHONUNBUFFERED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
 
     let out = '', err = '';
     py.stdout.on('data', (d) => (out += d.toString()));
     py.stderr.on('data', (d) => (err += d.toString()));
-
-    py.on('close', async () => {
+    py.on('close', async (code) => {
       try {
+        const resultPath = path.join(outDir, 'result.json');
         const j = await readJsonWithRetry(resultPath);
-        if (j && j.status === 'error') {
-          const msg = `${j.message || 'python error'} :: ${String(j.trace || '').slice(0, 400)}`;
-          return reject(new Error(msg));
-        }
-        return resolve(j);
+        if (j && j.status === 'error') return reject(new Error(j.message || 'python error'));
+        resolve(j);
       } catch (e) {
-        const snippet = (out || err || '').toString().slice(0, 800);
-        return reject(new Error(`invalid JSON from python: ${e}\n---\n${snippet}`));
+        console.error('analyze read error:', e, '\npyOut=', out, '\npyErr=', err);
+        reject(e);
       }
     });
   });
 }
 
 function runPythonResynthesize({ outDir, voiceId, linesPath }) {
-  const resultPath = path.join(outDir, 'result.json');
-
-  async function readJsonWithRetry(p, tries = 12, delayMs = 300) {
-    for (let i = 0; i < tries; i++) {
-      try {
-        const txt = await fs.readFile(p, 'utf-8');
-        if (txt && txt.trim().length > 0) return JSON.parse(txt);
-      } catch {}
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-    throw new Error('result.json missing or empty after retries');
-  }
-
   return new Promise((resolve, reject) => {
-    const py = spawn(
-      'python3',
-      [
-        'analyzer/analysis_service.py',
-        '--outdir', outDir,
-        '--voiceId', voiceId || DEFAULT_VOICE,
-        '--lines_path', linesPath // 분석 없이 라인 기반으로 TTS만 재생성
-      ],
-      { env: { ...process.env, PYTHONUNBUFFERED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] }
-    );
+    const pyArgs = [
+      'analysis_service.py',
+      '--outdir', outDir,
+      '--voiceId', voiceId || DEFAULT_VOICE,
+      '--lines_path', linesPath,
+    ];
+
+    const py = spawn('python3', pyArgs, { cwd: process.cwd(), env: { ...process.env, PYTHONUNBUFFERED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
 
     let out = '', err = '';
     py.stdout.on('data', (d) => (out += d.toString()));
     py.stderr.on('data', (d) => (err += d.toString()));
-
-    py.on('close', async () => {
+    py.on('close', async (_code) => {
       try {
+        const resultPath = path.join(outDir, 'result.json');
         const j = await readJsonWithRetry(resultPath);
-        if (j && j.status === 'error') {
-          const msg = `${j.message || 'python error'} :: ${String(j.trace || '').slice(0, 400)}`;
-          return reject(new Error(msg));
-        }
-        return resolve(j);
+        if (j && j.status === 'error') return reject(new Error(j.message || 'python error'));
+        resolve(j);
       } catch (e) {
-        const snippet = (out || err || '').toString().slice(0, 800);
-        return reject(new Error(`invalid JSON from python: ${e}\n---\n${snippet}`));
+        console.error('resynthesize read error:', e, '\npyOut=', out, '\npyErr=', err);
+        reject(e);
       }
     });
   });
 }
 
-// ---------- 업로드 저장소 ----------
-const storage = multer.diskStorage({
-  destination: (req, _file, cb) => {
-    const id = crypto.randomBytes(6).toString('hex') + '-' + Date.now().toString(36);
-    req.uploadId = id;
-    const dir = jobDir(id);
-    fs.ensureDir(dir).then(() => cb(null, dir)).catch(cb);
-  },
-  filename: (_req, _file, cb) => cb(null, 'video.mp4')
-});
-const upload = multer({ storage });
-
-// ---------- 라우트들 ----------
-
-// 1) 업로드만 (분석 X)
+// 1) 업로드만
 app.post('/upload-only', upload.single('video'), async (req, res) => {
   try {
-    const id = req.uploadId || crypto.randomBytes(6).toString('hex');
+    const file = req.file;
+    if (!file) throw new Error('no video');
+
+    const id = crypto.randomBytes(8).toString('hex');
     const dir = jobDir(id);
+    await fs.ensureDir(dir);
     const videoPath = path.join(dir, 'video.mp4');
-    if (!(await fs.pathExists(videoPath))) throw new Error('video not saved');
+    await fs.move(file.path, videoPath, { overwrite: true });
+
     return res.json({
       jobId: id,
       videoUrl: toUrl(videoPath),
@@ -165,13 +139,14 @@ app.post('/upload-only', upload.single('video'), async (req, res) => {
 // 2) 분석 + TTS
 app.post('/analyze', async (req, res) => {
   try {
-    const { jobId, voiceId } = req.body || {};
+    const { jobId, voiceId, fast } = req.body || {};
     if (!jobId) throw new Error('jobId required');
     const dir = jobDir(jobId);
     const videoPath = path.join(dir, 'video.mp4');
     if (!(await fs.pathExists(videoPath))) throw new Error('video not found for jobId');
 
-    const result = await runPythonAnalyze({ videoPath, outDir: dir, voiceId });
+    const result = await runPythonAnalyze({ videoPath, outDir: dir, voiceId, fast: String(fast) === '1' });
+
     return res.json({
       jobId,
       videoUrl: toUrl(videoPath),
@@ -197,7 +172,7 @@ app.post('/resynthesize', async (req, res) => {
     const videoPath = path.join(dir, 'video.mp4');
     if (!(await fs.pathExists(videoPath))) throw new Error('video not found for jobId');
 
-    // 기존 lines 불러오고, 요청으로 오버라이드
+    // 기존 result.json에서 lines 기본값 확보
     let base = null;
     const resultPath = path.join(dir, 'result.json');
     if (await fs.pathExists(resultPath)) {
@@ -225,41 +200,13 @@ app.post('/resynthesize', async (req, res) => {
       ttsUrl: toUrl(result.tts_path),
       script: (result && result.script) || (base && base.script) || '',
       lines: newLines,
-      timeline: (base && base.timeline) || [],
-      durationSec: (base && base.duration_sec) || null,
-      status: 'ready'
-    });
-  } catch (e) {
-    console.error('resynthesize failed', e);
-    res.status(500).json({ error: 'resynthesize failed', detail: String(e?.message || e) });
-  }
-});
-
-// (구) 업로드+분석 한방 (호환용)
-app.post('/upload', upload.single('video'), async (req, res) => {
-  try {
-    const id = req.uploadId || crypto.randomBytes(6).toString('hex');
-    const dir = jobDir(id);
-    const videoPath = path.join(dir, 'video.mp4');
-    const voiceId =
-      (req.body && req.body.voiceId) ||
-      (req.query && req.query.voiceId) ||
-      process.env.TOPMEDIA_VOICE;
-
-    const result = await runPythonAnalyze({ videoPath, outDir: dir, voiceId });
-    return res.json({
-      jobId: id,
-      videoUrl: toUrl(videoPath),
-      ttsUrl: toUrl(result.tts_path),
-      script: result.script,
-      lines: result.lines,
       timeline: result.timeline,
       durationSec: result.duration_sec,
       status: 'ready'
     });
   } catch (e) {
-    console.error('upload failed', e);
-    res.status(500).json({ error: 'upload/analysis failed', detail: String(e?.message || e) });
+    console.error('resynthesize failed', e);
+    res.status(500).json({ error: 'resynthesize failed', detail: String(e?.message || e) });
   }
 });
 
