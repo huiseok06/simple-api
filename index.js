@@ -151,11 +151,7 @@ app.post('/upload-only', upload.single('video'), async (req, res) => {
     const dir = jobDir(id);
     const videoPath = path.join(dir, 'video.mp4');
     if (!(await fs.pathExists(videoPath))) throw new Error('video not saved');
-    return res.json({
-      jobId: id,
-      videoUrl: toUrl(videoPath),
-      status: 'uploaded'
-    });
+    return res.json({ jobId: id, videoUrl: toUrl(videoPath), status: 'uploaded' });
   } catch (e) {
     console.error('upload-only failed', e);
     res.status(500).json({ error: 'upload-only failed', detail: String(e?.message || e) });
